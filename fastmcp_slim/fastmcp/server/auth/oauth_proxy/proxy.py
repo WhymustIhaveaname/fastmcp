@@ -271,6 +271,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # Token expiry fallback
         fallback_access_token_expiry_seconds: int | None = None,
         fallback_refresh_token_expiry_seconds: int | None = None,
+        fastmcp_access_token_ttl_seconds: int | None = None,
         # CIMD (Client ID Metadata Document) support
         enable_cimd: bool = True,
     ):
@@ -449,6 +450,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             fallback_refresh_token_expiry_seconds
             if fallback_refresh_token_expiry_seconds is not None
             else DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS
+        )
+        # When set, overrides the FastMCP-issued bearer's TTL (and its JTI
+        # mapping TTL) regardless of upstream `expires_in`. Upstream tokens are
+        # still tracked at their real expiry and refreshed internally.
+        self._fastmcp_access_token_ttl_seconds: int | None = (
+            fastmcp_access_token_ttl_seconds
         )
 
         if jwt_signing_key is None:
@@ -1141,11 +1148,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # Issue minimal FastMCP access token (just a reference via JTI)
         if client.client_id is None:
             raise TokenError("invalid_client", "Client ID is required")
+        bearer_expires_in = self._fastmcp_access_token_ttl_seconds or expires_in
         fastmcp_access_token = self.jwt_issuer.issue_access_token(
             client_id=client.client_id,
             scopes=granted_scopes,
             jti=access_jti,
-            expires_in=expires_in,
+            expires_in=bearer_expires_in,
             upstream_claims=upstream_claims,
         )
 
@@ -1169,7 +1177,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 upstream_token_id=upstream_token_id,
                 created_at=time.time(),
             ),
-            ttl=expires_in,  # Auto-expire with access token
+            ttl=bearer_expires_in,  # Auto-expire with access token
         )
         if refresh_jti:
             await self._jti_mapping_store.put(
@@ -1206,7 +1214,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         return OAuthToken(
             access_token=fastmcp_access_token,
             token_type="Bearer",
-            expires_in=expires_in,
+            expires_in=bearer_expires_in,
             refresh_token=fastmcp_refresh_token,
             scope=" ".join(granted_scopes),
         )
@@ -1461,11 +1469,14 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         if client.client_id is None:
             raise TokenError("invalid_client", "Client ID is required")
         new_access_jti = secrets.token_urlsafe(32)
+        new_bearer_expires_in = (
+            self._fastmcp_access_token_ttl_seconds or new_expires_in
+        )
         new_fastmcp_access = self.jwt_issuer.issue_access_token(
             client_id=client.client_id,
             scopes=refreshed_scopes,
             jti=new_access_jti,
-            expires_in=new_expires_in,
+            expires_in=new_bearer_expires_in,
             upstream_claims=upstream_claims,
         )
 
@@ -1477,7 +1488,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 upstream_token_id=upstream_token_set.upstream_token_id,
                 created_at=time.time(),
             ),
-            ttl=new_expires_in,  # Auto-expire with refreshed access token
+            ttl=new_bearer_expires_in,  # Auto-expire with refreshed access token
         )
 
         # Issue NEW minimal FastMCP refresh token (rotation for security).
@@ -1538,7 +1549,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         return OAuthToken(
             access_token=new_fastmcp_access,
             token_type="Bearer",
-            expires_in=new_expires_in,
+            expires_in=new_bearer_expires_in,
             refresh_token=new_fastmcp_refresh,  # NEW refresh token (rotated)
             scope=" ".join(refreshed_scopes),
         )
